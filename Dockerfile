@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
   python3-pip \
   ffmpeg \
   curl \
-  && pip install --no-cache-dir yt-dlp \
+  && pip install --no-cache-dir --break-system-packages yt-dlp \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
