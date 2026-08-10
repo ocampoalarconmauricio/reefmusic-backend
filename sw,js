@@ -1,0 +1,96 @@
+const CACHE = 'reefmusic-shell-v3';
+
+
+// Archivos necesarios para que la app cargue sin conexión.
+
+const APP_SHELL = [
+
+  './ReefMusic.html',
+
+  './manifest.json',
+
+  './icon.png',
+
+  './icon-192.png',
+
+  './icon-512.png'
+
+];
+
+
+// Safari rechaza usar en respondWith() una Response cuyo .redirected sea true
+
+// (error "Response served by service worker has redirections"). Reconstruimos
+
+// la respuesta para quitar esa bandera antes de guardarla o devolverla.
+
+async function stripRedirect(res) {
+
+  if (!res || !res.redirected) return res;
+
+  const body = await res.clone().blob();
+
+  return new Response(body, {
+
+    status: res.status,
+
+    statusText: res.statusText,
+
+    headers: res.headers
+
+  });
+
+}
+
+
+async function fetchAndCache(request, cacheKey) {
+
+  const res = await fetch(request);
+
+  const clean = await stripRedirect(res);
+
+  const cache = await caches.open(CACHE);
+
+  cache.put(cacheKey || request, clean.clone());
+
+  return clean;
+
+}
+
+
+self.addEventListener('install', e => {
+
+  e.waitUntil(
+
+    (async () => {
+
+      const cache = await caches.open(CACHE);
+
+      await Promise.all(APP_SHELL.map(async url => {
+
+        try {
+
+          const res = await fetch(url, { cache: 'reload' });
+
+          const clean = await stripRedirect(res);
+
+          await cache.put(url, clean);
+
+        } catch (err) {
+
+          console.warn('[SW] No se pudo precachear', url, err);
+
+        }
+
+      }));
+
+    })()
+
+  );
+
+  self.skipWaiting();
+
+});
+
+
+self.addEventListener('activate', e => {
