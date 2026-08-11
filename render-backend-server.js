@@ -17,8 +17,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const FormData = require('form-data');
-const crypto = require('crypto');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
 
 const app = express();
@@ -88,14 +87,6 @@ function sanitizeUsername(str) {
 }
 
 /**
- * Codifica cada tramo de una clave de R2 por separado (para no romper las
- * "/" que separan carpetas), igual que hace el frontend con r2Url().
- */
-function encodeR2Key(key) {
-  return String(key).split('/').map(encodeURIComponent).join('/');
-}
-
-/**
  * Busca en SoundCloud la canción usando yt-dlp (fallback cuando no hay
  * una URL puntual elegida por el usuario).
  */
@@ -113,7 +104,7 @@ function searchSoundCloud(query) {
  * al usuario. SoundCloud no tiene el bloqueo anti-bot que tiene YouTube en
  * IPs de datacenter, así que no hace falta cookies ni trucos de cliente.
  */
-function searchSoundCloudMultiple(query, limit = 12) {
+function searchSoundCloudMultiple(query, limit = 5) {
   try {
     const raw = execFileSync('yt-dlp', [
       `scsearch${limit}:${query}`,
@@ -230,80 +221,43 @@ async function uploadCoverIfPossible(thumbnailUrl, coverKey) {
   }
 }
 
+// pub-xxxx.r2.dev es un dominio público de SOLO LECTURA (para reproducir),
+// no acepta subidas autenticadas. Las subidas van al endpoint real de la
+// API S3 de Cloudflare, firmado con el SDK oficial (evita reinventar SigV4).
+const r2Client = new S3Client({
+  region: 'auto',
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: R2_ACCESS_KEY,
+    secretAccessKey: R2_SECRET_KEY,
+  },
+});
+
 /**
- * Sube archivo a Cloudflare R2
+ * Sube archivo a Cloudflare R2. "key" es la clave RAW (sin percent-encode) —
+ * el SDK se encarga de codificarla en el request; el frontend hace su propio
+ * encodeURIComponent por tramo al armar la URL pública de lectura.
  */
-async function uploadToR2(filePath, fileName, contentType = 'audio/mpeg') {
+async function uploadToR2(filePath, key, contentType = 'audio/mpeg') {
   try {
-    console.log(`☁️  Subiendo a R2: ${fileName}`);
+    console.log(`☁️  Subiendo a R2: ${key}`);
 
     const fileContent = fs.readFileSync(filePath);
-    const fileSize = fileContent.length;
 
-    const now = new Date().toUTCString();
-    const authorization = generateR2Authorization('PUT', fileName, now, fileSize);
+    await r2Client.send(new PutObjectCommand({
+      Bucket: R2_BUCKET_NAME,
+      Key: key,
+      Body: fileContent,
+      ContentType: contentType,
+    }));
 
-    const response = await axios.put(
-      `${R2_PUBLIC_URL}/${fileName}`,
-      fileContent,
-      {
-        headers: {
-          'Authorization': authorization,
-          'Date': now,
-          'Content-Type': contentType,
-          'Content-Length': fileSize
-        }
-      }
-    );
-    
-    if (response.status >= 200 && response.status < 300) {
-      console.log(`✅ Subido a R2: ${R2_PUBLIC_URL}/${fileName}`);
-      return `${R2_PUBLIC_URL}/${fileName}`;
-    } else {
-      throw new Error(`R2 respondió con código ${response.status}`);
-    }
+    const publicUrl = `${R2_PUBLIC_URL}/${key.split('/').map(encodeURIComponent).join('/')}`;
+    console.log(`✅ Subido a R2: ${publicUrl}`);
+    return publicUrl;
   } catch (error) {
     console.error('Error subiendo a R2:', error.message);
     throw new Error(`Fallo al subir a R2: ${error.message}`);
   }
-}
-
-/**
- * Genera la cabecera de autorización AWS Signature V4 para R2
- */
-function generateR2Authorization(method, key, date, contentLength) {
-  // "date" es un toUTCString(), ej: "Tue, 11 Aug 2026 00:34:03 GMT".
-  // Necesitamos el "dateStamp" YYYYMMDD para el scope de la firma.
-  const d = new Date(date);
-  const dateStamp = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-
-  // AWS Signature V4 (simplificado para R2)
-  const scope = `${dateStamp}/auto/s3/aws4_request`;
-  
-  const canonicalRequest = [
-    method,
-    `/${key}`,
-    '',
-    `date:${date}`,
-    'host:' + R2_PUBLIC_URL.split('://')[1],
-    '',
-    'date;host',
-    '' // Sin payload (sin necesidad de hash)
-  ].join('\n');
-  
-  const stringToSign = [
-    'AWS4-HMAC-SHA256',
-    date,
-    scope,
-    crypto.createHash('sha256').update(canonicalRequest).digest('hex')
-  ].join('\n');
-  
-  const signingKey = crypto
-    .createHmac('sha256', `AWS4${R2_SECRET_KEY}`)
-    .update(stringToSign)
-    .digest('hex');
-  
-  return `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY}/${scope}, SignedHeaders=date;host, Signature=${signingKey}`;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -323,7 +277,7 @@ app.get('/api/search', (req, res) => {
   }
 
   try {
-    const results = searchSoundCloudMultiple(q, 12);
+    const results = searchSoundCloudMultiple(q, 5);
     return res.json({ success: true, results });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
@@ -411,8 +365,8 @@ app.post('/api/download-and-upload', async (req, res) => {
     const trackId = generateTrackId();
     const baseFileName = `${sanitizeForFilename(finalArtistName)} - ${sanitizeForFilename(finalTrackName)}`.trim()
       || `track_${Date.now()}`;
-    const mp3Key       = encodeR2Key(`${user}/${baseFileName}.mp3`);
-    const coverKey     = encodeR2Key(`${user}/${baseFileName}_cover.jpg`);
+    const mp3Key       = `${user}/${baseFileName}.mp3`;
+    const coverKey     = `${user}/${baseFileName}_cover.jpg`;
     const tempMp3Path  = path.join(TEMP_DIR, `${trackId}.mp3`);
 
     // 1. Descargar y convertir
