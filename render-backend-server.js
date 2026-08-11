@@ -49,7 +49,19 @@ if (!fs.existsSync(TEMP_DIR)) {
 // desde un servidor sin navegador es pasarle un cookies.txt de una sesión
 // real. Subilo como "Secret File" en Render (nombre "cookies.txt", se monta
 // en /etc/secrets/cookies.txt) o seteá YTDLP_COOKIES_PATH con la ruta.
-const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || '/etc/secrets/cookies.txt';
+const YTDLP_COOKIES_SOURCE = process.env.YTDLP_COOKIES_PATH || '/etc/secrets/cookies.txt';
+// yt-dlp reescribe el archivo de cookies al terminar (para guardar cookies
+// renovadas), pero los Secret Files de Render se montan de solo lectura.
+// Copiamos el archivo a /tmp, que sí es escribible, y usamos esa copia.
+const YTDLP_COOKIES_PATH = path.join(TEMP_DIR, 'cookies.txt');
+if (fs.existsSync(YTDLP_COOKIES_SOURCE)) {
+  try {
+    fs.copyFileSync(YTDLP_COOKIES_SOURCE, YTDLP_COOKIES_PATH);
+    console.log('🍪 cookies.txt copiado a una ruta escribible para yt-dlp');
+  } catch (err) {
+    console.error('No se pudo copiar cookies.txt a una ruta escribible:', err.message);
+  }
+}
 
 function ytDlpCookieArgs() {
   return fs.existsSync(YTDLP_COOKIES_PATH) ? ['--cookies', YTDLP_COOKIES_PATH] : [];
