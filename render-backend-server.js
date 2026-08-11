@@ -13,7 +13,7 @@
 
 const express = require('express');
 const cors = require('cors');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -55,22 +55,112 @@ function generateTrackId() {
   return `track_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
+// IDs de video de YouTube: siempre 11 caracteres alfanuméricos (+ "-"/"_").
+// Se valida estricto porque el id se inserta como argumento de yt-dlp.
+const YOUTUBE_ID_RE = /^[A-Za-z0-9_-]{6,20}$/;
+
 /**
- * Busca en YouTube la canción usando yt-dlp
+ * Limpia un texto para poder usarlo como nombre de archivo / clave de R2.
+ */
+function sanitizeForFilename(str) {
+  return String(str || '')
+    .replace(/[\/\\:*?"<>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100);
+}
+
+/**
+ * Limpia el nombre de usuario para usarlo como prefijo de carpeta en R2.
+ */
+function sanitizeUsername(str) {
+  return String(str || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60);
+}
+
+/**
+ * Codifica cada tramo de una clave de R2 por separado (para no romper las
+ * "/" que separan carpetas), igual que hace el frontend con r2Url().
+ */
+function encodeR2Key(key) {
+  return String(key).split('/').map(encodeURIComponent).join('/');
+}
+
+/**
+ * Busca en YouTube la canción usando yt-dlp (fallback cuando no hay
+ * un videoId puntual elegido por el usuario).
  */
 function searchYouTube(query) {
   try {
-    const cmd = `yt-dlp -f bestaudio --get-url "ytsearch:${query}" -q --no-warnings`;
-    const result = execSync(cmd, { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
-    
+    const result = execFileSync('yt-dlp', [
+      '-f', 'bestaudio', '--get-url',
+      `ytsearch:${query}`,
+      '-q', '--no-warnings'
+    ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
+
     if (!result) {
       throw new Error('No se encontró video en YouTube');
     }
-    
+
     return result.split('\n')[0]; // Retorna la primera URL
   } catch (error) {
     console.error('Error buscando en YouTube:', error.message);
     throw new Error('No se pudo encontrar la canción en YouTube');
+  }
+}
+
+/**
+ * Busca en YouTube y devuelve varios resultados (título, canal, duración,
+ * thumbnail, videoId) SIN descargar nada — para mostrar una lista al usuario.
+ */
+function searchYouTubeMultiple(query, limit = 12) {
+  try {
+    const raw = execFileSync('yt-dlp', [
+      `ytsearch${limit}:${query}`,
+      '--flat-playlist',
+      '--dump-json',
+      '-q', '--no-warnings'
+    ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
+
+    if (!raw) return [];
+
+    return raw.split('\n').filter(Boolean).map(line => {
+      let v;
+      try { v = JSON.parse(line); } catch (_) { return null; }
+      if (!v || !v.id) return null;
+      return {
+        videoId: v.id,
+        title: v.title || 'Sin título',
+        artist: v.channel || v.uploader || '',
+        duration: v.duration || 0,
+        thumbnail: `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`,
+      };
+    }).filter(Boolean);
+  } catch (error) {
+    console.error('Error buscando en YouTube:', error.message);
+    throw new Error('No se pudo buscar en YouTube');
+  }
+}
+
+/**
+ * Obtiene una URL de audio directa (para reproducir un preview) sin
+ * descargar el archivo al disco.
+ */
+function getStreamUrl(videoId) {
+  if (!YOUTUBE_ID_RE.test(videoId)) {
+    throw new Error('videoId inválido');
+  }
+  try {
+    const result = execFileSync('yt-dlp', [
+      '-f', 'bestaudio', '--get-url',
+      `https://www.youtube.com/watch?v=${videoId}`,
+      '-q', '--no-warnings'
+    ], { encoding: 'utf-8', maxBuffer: 1024 * 1024 }).trim();
+
+    if (!result) throw new Error('No se pudo obtener el audio');
+    return result.split('\n')[0];
+  } catch (error) {
+    console.error('Error obteniendo stream:', error.message);
+    throw new Error('No se pudo obtener el audio de esa canción');
   }
 }
 
@@ -80,30 +170,32 @@ function searchYouTube(query) {
 async function downloadAndConvertToMP3(youtubeUrl, outputPath) {
   try {
     console.log(`📥 Descargando de: ${youtubeUrl}`);
-    
+
     const tempAudio = path.join(TEMP_DIR, `temp_${Date.now()}.webm`);
-    
+
     // Descargar con yt-dlp
-    const downloadCmd = `yt-dlp -f bestaudio -o "${tempAudio}" "${youtubeUrl}" -q --no-warnings`;
-    execSync(downloadCmd, { maxBuffer: 50 * 1024 * 1024 });
-    
+    execFileSync('yt-dlp', [
+      '-f', 'bestaudio', '-o', tempAudio, youtubeUrl, '-q', '--no-warnings'
+    ], { maxBuffer: 50 * 1024 * 1024 });
+
     if (!fs.existsSync(tempAudio)) {
       throw new Error('La descarga falló');
     }
-    
+
     console.log(`🔄 Convirtiendo a MP3...`);
-    
+
     // Convertir a MP3 con ffmpeg
-    const ffmpegCmd = `ffmpeg -i "${tempAudio}" -q:a 0 -map a "${outputPath}" -y -loglevel error`;
-    execSync(ffmpegCmd);
-    
+    execFileSync('ffmpeg', [
+      '-i', tempAudio, '-q:a', '0', '-map', 'a', outputPath, '-y', '-loglevel', 'error'
+    ]);
+
     // Eliminar archivo temporal
     fs.unlinkSync(tempAudio);
-    
+
     if (!fs.existsSync(outputPath)) {
       throw new Error('La conversión a MP3 falló');
     }
-    
+
     console.log(`✅ MP3 listo: ${outputPath}`);
     return true;
   } catch (error) {
@@ -113,18 +205,38 @@ async function downloadAndConvertToMP3(youtubeUrl, outputPath) {
 }
 
 /**
+ * Descarga una imagen de portada (thumbnail) y la sube a R2 junto a la
+ * canción. Best-effort: si falla, no rompe el flujo de descarga principal.
+ */
+async function uploadCoverIfPossible(thumbnailUrl, coverKey) {
+  if (!thumbnailUrl) return null;
+  const tempCover = path.join(TEMP_DIR, `cover_${Date.now()}.jpg`);
+  try {
+    const resp = await axios.get(thumbnailUrl, { responseType: 'arraybuffer', timeout: 8000 });
+    fs.writeFileSync(tempCover, resp.data);
+    const url = await uploadToR2(tempCover, coverKey, 'image/jpeg');
+    return url;
+  } catch (error) {
+    console.warn('No se pudo subir la portada:', error.message);
+    return null;
+  } finally {
+    if (fs.existsSync(tempCover)) fs.unlinkSync(tempCover);
+  }
+}
+
+/**
  * Sube archivo a Cloudflare R2
  */
-async function uploadToR2(filePath, fileName) {
+async function uploadToR2(filePath, fileName, contentType = 'audio/mpeg') {
   try {
     console.log(`☁️  Subiendo a R2: ${fileName}`);
-    
+
     const fileContent = fs.readFileSync(filePath);
     const fileSize = fileContent.length;
-    
+
     const now = new Date().toUTCString();
     const authorization = generateR2Authorization('PUT', fileName, now, fileSize);
-    
+
     const response = await axios.put(
       `${R2_PUBLIC_URL}/${fileName}`,
       fileContent,
@@ -132,7 +244,7 @@ async function uploadToR2(filePath, fileName) {
         headers: {
           'Authorization': authorization,
           'Date': now,
-          'Content-Type': 'audio/mpeg',
+          'Content-Type': contentType,
           'Content-Length': fileSize
         }
       }
@@ -191,65 +303,140 @@ function generateR2Authorization(method, key, date, contentLength) {
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
+ * GET /api/search?q=...
+ *
+ * Busca canciones en YouTube (sin descargar) y devuelve una lista de
+ * resultados para que el usuario elija cuál quiere escuchar/descargar.
+ */
+app.get('/api/search', (req, res) => {
+  const q = (req.query.q || '').toString().trim();
+  if (!q) {
+    return res.status(400).json({ success: false, error: 'Falta el parámetro q' });
+  }
+
+  try {
+    const results = searchYouTubeMultiple(q, 12);
+    return res.json({ success: true, results });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/stream?id=videoId
+ *
+ * Devuelve una URL de audio directa para reproducir un preview antes
+ * de descargar la canción.
+ */
+app.get('/api/stream', (req, res) => {
+  const id = (req.query.id || '').toString().trim();
+  if (!id) {
+    return res.status(400).json({ success: false, error: 'Falta el parámetro id' });
+  }
+
+  try {
+    const url = getStreamUrl(id);
+    return res.json({ success: true, url });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * POST /api/download-and-upload
- * 
- * Body:
+ *
+ * Body (buscador nuevo, canción puntual ya elegida por el usuario):
+ * {
+ *   "videoId": "dQw4w9WgXcQ",
+ *   "trackName": "Levitating",
+ *   "artistName": "Dua Lipa",
+ *   "artworkUrl": "https://...",
+ *   "username": "maria"
+ * }
+ *
+ * Body (modo legacy, sin videoId — busca a ciegas por texto):
  * {
  *   "trackName": "Levitating",
  *   "artistName": "Dua Lipa",
  *   "collectionName": "Future Nostalgia",
- *   "artworkUrl": "https://..."
+ *   "artworkUrl": "https://...",
+ *   "username": "maria"
  * }
+ *
+ * "username" define la carpeta del usuario en R2 (misma convención que usa
+ * el resto de la app: "usuario/Artista - Título.mp3") para que la canción
+ * aparezca en su biblioteca al sincronizar.
  */
 app.post('/api/download-and-upload', async (req, res) => {
-  const { trackName, artistName, collectionName, artworkUrl } = req.body;
-  
+  const { videoId, trackName, artistName, collectionName, artworkUrl, username } = req.body;
+
   try {
-    // Validar datos
-    if (!trackName || !artistName) {
-      return res.status(400).json({
-        success: false,
-        error: 'trackName y artistName son requeridos'
-      });
+    const user = sanitizeUsername(username);
+    if (!user) {
+      return res.status(400).json({ success: false, error: 'username es requerido' });
     }
-    
-    console.log(`\n🎵 Nuevo track: ${trackName} - ${artistName}`);
-    
+
+    let youtubeUrl;
+    let finalTrackName  = trackName;
+    let finalArtistName = artistName;
+
+    if (videoId) {
+      if (!YOUTUBE_ID_RE.test(videoId)) {
+        return res.status(400).json({ success: false, error: 'videoId inválido' });
+      }
+      youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      finalTrackName  = trackName  || 'Sin título';
+      finalArtistName = artistName || 'Artista desconocido';
+    } else {
+      if (!trackName || !artistName) {
+        return res.status(400).json({
+          success: false,
+          error: 'trackName y artistName son requeridos'
+        });
+      }
+      const query = `${trackName} ${artistName} official audio`;
+      youtubeUrl = searchYouTube(query);
+    }
+
+    console.log(`\n🎵 Nuevo track: ${finalTrackName} - ${finalArtistName} (usuario: ${user})`);
+
     const trackId = generateTrackId();
-    const fileName = `${trackId}.mp3`;
-    const tempMp3Path = path.join(TEMP_DIR, fileName);
-    
-    // 1. Buscar en YouTube
-    const query = `${trackName} ${artistName} official audio`;
-    const youtubeUrl = searchYouTube(query);
-    
-    // 2. Descargar y convertir
+    const baseFileName = `${sanitizeForFilename(finalArtistName)} - ${sanitizeForFilename(finalTrackName)}`.trim()
+      || `track_${Date.now()}`;
+    const mp3Key       = encodeR2Key(`${user}/${baseFileName}.mp3`);
+    const coverKey     = encodeR2Key(`${user}/${baseFileName}_cover.jpg`);
+    const tempMp3Path  = path.join(TEMP_DIR, `${trackId}.mp3`);
+
+    // 1. Descargar y convertir
     await downloadAndConvertToMP3(youtubeUrl, tempMp3Path);
-    
-    // 3. Subir a R2
-    const r2Url = await uploadToR2(tempMp3Path, fileName);
-    
-    // 4. Limpiar temporal
+
+    // 2. Subir a R2 bajo la carpeta del usuario
+    const r2Url = await uploadToR2(tempMp3Path, mp3Key, 'audio/mpeg');
+
+    // 3. Limpiar temporal
     fs.unlinkSync(tempMp3Path);
-    
+
+    // 4. Subir portada (best-effort, no bloquea si falla)
+    const coverUrl = await uploadCoverIfPossible(artworkUrl, coverKey);
+
     // 5. Retornar metadata
     const response = {
       success: true,
       trackId,
       url: r2Url,
       track: {
-        trackName: trackName || 'Desconocido',
-        artistName: artistName || 'Artista desconocido',
+        trackName: finalTrackName || 'Desconocido',
+        artistName: finalArtistName || 'Artista desconocido',
         collectionName: collectionName || 'Álbum desconocido',
-        artworkUrl: artworkUrl || null,
+        artworkUrl: coverUrl || artworkUrl || null,
         downloadedAt: new Date().toISOString(),
         duration: 0 // Se puede obtener con ffprobe si es necesario
       }
     };
-    
+
     console.log(`✨ Track completado: ${trackId}`);
     return res.json(response);
-    
+
   } catch (error) {
     console.error('❌ Error:', error.message);
     return res.status(500).json({
@@ -277,7 +464,7 @@ app.get('/api/health', (req, res) => {
  */
 app.get('/api/test-youtube', (req, res) => {
   try {
-    const result = execSync('yt-dlp --version', { encoding: 'utf-8' });
+    const result = execFileSync('yt-dlp', ['--version'], { encoding: 'utf-8' });
     res.json({
       status: 'ok',
       ytdlp: result.trim()
