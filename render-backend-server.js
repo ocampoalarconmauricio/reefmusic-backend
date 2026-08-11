@@ -125,7 +125,7 @@ function encodeR2Key(key) {
 function searchYouTube(query) {
   try {
     const result = execFileSync('yt-dlp', [
-      '-f', 'bestaudio', '--get-url',
+      '-f', 'bestaudio/best', '--get-url',
       `ytsearch:${query}`,
       '-q', '--no-warnings',
       ...ytDlpCookieArgs()
@@ -191,7 +191,7 @@ function getStreamUrl(videoId) {
     // "bestaudio": Safari/iOS no reproduce webm, así que sin esto el
     // preview no suena en iPhone aunque la URL sea válida.
     const result = execFileSync('yt-dlp', [
-      '-f', 'bestaudio[ext=m4a]/bestaudio', '--get-url',
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best', '--get-url',
       `https://www.youtube.com/watch?v=${videoId}`,
       '-q', '--no-warnings',
       ...ytDlpCookieArgs()
@@ -217,7 +217,7 @@ async function downloadAndConvertToMP3(youtubeUrl, outputPath) {
 
     // Descargar con yt-dlp
     execFileSync('yt-dlp', [
-      '-f', 'bestaudio', '-o', tempAudio, youtubeUrl, '-q', '--no-warnings',
+      '-f', 'bestaudio/best', '-o', tempAudio, youtubeUrl, '-q', '--no-warnings',
       ...ytDlpCookieArgs()
     ], { maxBuffer: 50 * 1024 * 1024 });
 
