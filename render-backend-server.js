@@ -44,6 +44,17 @@ if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
+// YouTube bloquea las IPs de datacenter (como las de Render) pidiendo
+// "Sign in to confirm you're not a bot". La forma soportada de evitarlo
+// desde un servidor sin navegador es pasarle un cookies.txt de una sesión
+// real. Subilo como "Secret File" en Render (nombre "cookies.txt", se monta
+// en /etc/secrets/cookies.txt) o seteá YTDLP_COOKIES_PATH con la ruta.
+const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || '/etc/secrets/cookies.txt';
+
+function ytDlpCookieArgs() {
+  return fs.existsSync(YTDLP_COOKIES_PATH) ? ['--cookies', YTDLP_COOKIES_PATH] : [];
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // UTILIDADES
 // ────────────────────────────────────────────────────────────────────────────
@@ -94,7 +105,8 @@ function searchYouTube(query) {
     const result = execFileSync('yt-dlp', [
       '-f', 'bestaudio', '--get-url',
       `ytsearch:${query}`,
-      '-q', '--no-warnings'
+      '-q', '--no-warnings',
+      ...ytDlpCookieArgs()
     ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
 
     if (!result) {
@@ -118,7 +130,8 @@ function searchYouTubeMultiple(query, limit = 12) {
       `ytsearch${limit}:${query}`,
       '--flat-playlist',
       '--dump-json',
-      '-q', '--no-warnings'
+      '-q', '--no-warnings',
+      ...ytDlpCookieArgs()
     ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
 
     if (!raw) return [];
@@ -150,10 +163,14 @@ function getStreamUrl(videoId) {
     throw new Error('videoId inválido');
   }
   try {
+    // Preferimos m4a/AAC en vez del webm/opus que suele ganar como
+    // "bestaudio": Safari/iOS no reproduce webm, así que sin esto el
+    // preview no suena en iPhone aunque la URL sea válida.
     const result = execFileSync('yt-dlp', [
-      '-f', 'bestaudio', '--get-url',
+      '-f', 'bestaudio[ext=m4a]/bestaudio', '--get-url',
       `https://www.youtube.com/watch?v=${videoId}`,
-      '-q', '--no-warnings'
+      '-q', '--no-warnings',
+      ...ytDlpCookieArgs()
     ], { encoding: 'utf-8', maxBuffer: 1024 * 1024 }).trim();
 
     if (!result) throw new Error('No se pudo obtener el audio');
@@ -175,7 +192,8 @@ async function downloadAndConvertToMP3(youtubeUrl, outputPath) {
 
     // Descargar con yt-dlp
     execFileSync('yt-dlp', [
-      '-f', 'bestaudio', '-o', tempAudio, youtubeUrl, '-q', '--no-warnings'
+      '-f', 'bestaudio', '-o', tempAudio, youtubeUrl, '-q', '--no-warnings',
+      ...ytDlpCookieArgs()
     ], { maxBuffer: 50 * 1024 * 1024 });
 
     if (!fs.existsSync(tempAudio)) {
