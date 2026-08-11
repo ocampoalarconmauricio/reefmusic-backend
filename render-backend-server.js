@@ -57,14 +57,29 @@ const YTDLP_COOKIES_PATH = path.join(TEMP_DIR, 'cookies.txt');
 if (fs.existsSync(YTDLP_COOKIES_SOURCE)) {
   try {
     fs.copyFileSync(YTDLP_COOKIES_SOURCE, YTDLP_COOKIES_PATH);
-    console.log('🍪 cookies.txt copiado a una ruta escribible para yt-dlp');
+    const lines = fs.readFileSync(YTDLP_COOKIES_PATH, 'utf-8').split('\n');
+    const looksNetscape = lines[0]?.startsWith('# Netscape HTTP Cookie File') || lines[0]?.startsWith('# HTTP Cookie File');
+    const youtubeCookieLines = lines.filter(l => /\.?youtube\.com|\.?google\.com/.test(l) && !l.startsWith('#')).length;
+    console.log(`🍪 cookies.txt copiado a una ruta escribible para yt-dlp (${lines.length} líneas, formato Netscape: ${looksNetscape}, cookies de youtube/google: ${youtubeCookieLines})`);
+    if (!looksNetscape || youtubeCookieLines === 0) {
+      console.warn('⚠️  El cookies.txt no parece válido — yt-dlp necesita el formato Netscape con cookies reales de una sesión logueada en youtube.com.');
+    }
   } catch (err) {
     console.error('No se pudo copiar cookies.txt a una ruta escribible:', err.message);
   }
+} else {
+  console.warn(`⚠️  No se encontró cookies.txt en ${YTDLP_COOKIES_SOURCE} — las descargas van a fallar por el bloqueo anti-bot de YouTube.`);
 }
 
 function ytDlpCookieArgs() {
   return fs.existsSync(YTDLP_COOKIES_PATH) ? ['--cookies', YTDLP_COOKIES_PATH] : [];
+}
+
+// El cliente "web" (el que usa yt-dlp por defecto) es el que YouTube más
+// exige con PO token en IPs de datacenter. El cliente "tv" suele esquivar
+// ese chequeo incluso sin PO token. Se combina con cookies igual.
+function ytDlpClientArgs() {
+  return ['--extractor-args', 'youtube:player_client=tv'];
 }
 
 /**
@@ -128,7 +143,8 @@ function searchYouTube(query) {
       '-f', 'bestaudio/best', '--get-url',
       `ytsearch:${query}`,
       '-q', '--no-warnings',
-      ...ytDlpCookieArgs()
+      ...ytDlpCookieArgs(),
+      ...ytDlpClientArgs()
     ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
 
     if (!result) {
@@ -154,7 +170,8 @@ function searchYouTubeMultiple(query, limit = 12) {
       '--flat-playlist',
       '--dump-json',
       '-q', '--no-warnings',
-      ...ytDlpCookieArgs()
+      ...ytDlpCookieArgs(),
+      ...ytDlpClientArgs()
     ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
 
     if (!raw) return [];
@@ -194,7 +211,8 @@ function getStreamUrl(videoId) {
       '-f', 'bestaudio[ext=m4a]/bestaudio/best', '--get-url',
       `https://www.youtube.com/watch?v=${videoId}`,
       '-q', '--no-warnings',
-      ...ytDlpCookieArgs()
+      ...ytDlpCookieArgs(),
+      ...ytDlpClientArgs()
     ], { encoding: 'utf-8', maxBuffer: 1024 * 1024 }).trim();
 
     if (!result) throw new Error('No se pudo obtener el audio');
@@ -218,7 +236,8 @@ async function downloadAndConvertToMP3(youtubeUrl, outputPath) {
     // Descargar con yt-dlp
     execFileSync('yt-dlp', [
       '-f', 'bestaudio/best', '-o', tempAudio, youtubeUrl, '-q', '--no-warnings',
-      ...ytDlpCookieArgs()
+      ...ytDlpCookieArgs(),
+      ...ytDlpClientArgs()
     ], { maxBuffer: 50 * 1024 * 1024 });
 
     if (!fs.existsSync(tempAudio)) {
