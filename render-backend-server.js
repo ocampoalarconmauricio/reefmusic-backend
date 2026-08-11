@@ -55,6 +55,16 @@ function ytDlpCookieArgs() {
   return fs.existsSync(YTDLP_COOKIES_PATH) ? ['--cookies', YTDLP_COOKIES_PATH] : [];
 }
 
+/**
+ * Extrae el mensaje de error real de yt-dlp/ffmpeg (stderr) para poder
+ * devolverlo en la respuesta y diagnosticar sin entrar a los logs de Render.
+ */
+function processErrorMessage(error) {
+  const raw = error.stderr ? error.stderr.toString() : (error.message || '');
+  const lastLine = String(raw).trim().split('\n').filter(Boolean).pop() || String(raw).trim();
+  return lastLine.slice(0, 300) || 'Error desconocido';
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // UTILIDADES
 // ────────────────────────────────────────────────────────────────────────────
@@ -115,8 +125,9 @@ function searchYouTube(query) {
 
     return result.split('\n')[0]; // Retorna la primera URL
   } catch (error) {
-    console.error('Error buscando en YouTube:', error.message);
-    throw new Error('No se pudo encontrar la canción en YouTube');
+    const detail = processErrorMessage(error);
+    console.error('Error buscando en YouTube:', detail);
+    throw new Error(`No se pudo encontrar la canción en YouTube: ${detail}`);
   }
 }
 
@@ -149,8 +160,9 @@ function searchYouTubeMultiple(query, limit = 12) {
       };
     }).filter(Boolean);
   } catch (error) {
-    console.error('Error buscando en YouTube:', error.message);
-    throw new Error('No se pudo buscar en YouTube');
+    const detail = processErrorMessage(error);
+    console.error('Error buscando en YouTube:', detail);
+    throw new Error(`No se pudo buscar en YouTube: ${detail}`);
   }
 }
 
@@ -176,8 +188,9 @@ function getStreamUrl(videoId) {
     if (!result) throw new Error('No se pudo obtener el audio');
     return result.split('\n')[0];
   } catch (error) {
-    console.error('Error obteniendo stream:', error.message);
-    throw new Error('No se pudo obtener el audio de esa canción');
+    const detail = processErrorMessage(error);
+    console.error('Error obteniendo stream:', detail);
+    throw new Error(`No se pudo obtener el audio de esa canción: ${detail}`);
   }
 }
 
@@ -217,8 +230,9 @@ async function downloadAndConvertToMP3(youtubeUrl, outputPath) {
     console.log(`✅ MP3 listo: ${outputPath}`);
     return true;
   } catch (error) {
-    console.error('Error en descarga/conversión:', error.message);
-    throw new Error(`Fallo en descarga: ${error.message}`);
+    const detail = processErrorMessage(error);
+    console.error('Error en descarga/conversión:', detail);
+    throw new Error(`Fallo en descarga: ${detail}`);
   }
 }
 
