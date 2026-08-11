@@ -76,10 +76,12 @@ function ytDlpCookieArgs() {
 }
 
 // El cliente "web" (el que usa yt-dlp por defecto) es el que YouTube más
-// exige con PO token en IPs de datacenter. El cliente "tv" suele esquivar
-// ese chequeo incluso sin PO token. Se combina con cookies igual.
+// exige con PO token en IPs de datacenter. "tv" suele esquivar ese chequeo
+// pero a veces no expone formatos para algunos videos puntuales — se listan
+// varios clientes para que yt-dlp se quede con el primero que tenga formatos
+// usables en vez de fallar entero por uno solo.
 function ytDlpClientArgs() {
-  return ['--extractor-args', 'youtube:player_client=tv'];
+  return ['--extractor-args', 'youtube:player_client=tv,android,web'];
 }
 
 /**
