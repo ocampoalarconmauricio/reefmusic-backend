@@ -161,9 +161,32 @@ function getStreamUrl(trackUrl) {
 }
 
 /**
- * Descarga audio desde una URL de SoundCloud y lo convierte a MP3
+ * Duración real de un archivo de audio en segundos (via ffprobe), 0 si falla.
  */
-async function downloadAndConvertToMP3(trackUrl, outputPath) {
+function getAudioDuration(filePath) {
+  try {
+    const result = execFileSync('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      filePath
+    ], { encoding: 'utf-8' }).trim();
+    return Math.round(parseFloat(result)) || 0;
+  } catch (error) {
+    console.warn('No se pudo leer la duración con ffprobe:', error.message);
+    return 0;
+  }
+}
+
+/**
+ * Descarga audio desde una URL de SoundCloud y lo convierte a MP3.
+ * "expectedDuration" es la duración real de la canción (según la metadata
+ * de búsqueda) — algunas canciones de sellos discográficos grandes solo
+ * exponen un preview de 30s vía la API pública de SoundCloud, aunque la
+ * metadata reporte la duración completa. Si detectamos ese caso, fallamos
+ * con un mensaje claro en vez de subir un clip de 30s sin avisar.
+ */
+async function downloadAndConvertToMP3(trackUrl, outputPath, expectedDuration = 0) {
   try {
     console.log(`📥 Descargando de: ${trackUrl}`);
 
@@ -192,12 +215,19 @@ async function downloadAndConvertToMP3(trackUrl, outputPath) {
       throw new Error('La conversión a MP3 falló');
     }
 
-    console.log(`✅ MP3 listo: ${outputPath}`);
-    return true;
+    const actualDuration = getAudioDuration(outputPath);
+    console.log(`✅ MP3 listo: ${outputPath} (${actualDuration}s, esperados ~${expectedDuration}s)`);
+
+    if (actualDuration > 0 && actualDuration <= 35 && expectedDuration > 60) {
+      fs.unlinkSync(outputPath);
+      throw new Error('Esta canción solo tiene disponible un preview de 30s en SoundCloud (restricción de derechos del sello discográfico) — no se puede descargar completa. Probá buscar un remix, versión en vivo, DJ set o subida de otro usuario.');
+    }
+
+    return actualDuration;
   } catch (error) {
     const detail = processErrorMessage(error);
     console.error('Error en descarga/conversión:', detail);
-    throw new Error(`Fallo en descarga: ${detail}`);
+    throw new Error(error.message?.startsWith('Esta canción') ? error.message : `Fallo en descarga: ${detail}`);
   }
 }
 
@@ -330,7 +360,7 @@ app.get('/api/stream', (req, res) => {
  * aparezca en su biblioteca al sincronizar.
  */
 app.post('/api/download-and-upload', async (req, res) => {
-  const { trackUrl, trackName, artistName, collectionName, artworkUrl, username } = req.body;
+  const { trackUrl, trackName, artistName, collectionName, artworkUrl, username, duration } = req.body;
 
   try {
     const user = sanitizeUsername(username);
@@ -370,7 +400,7 @@ app.post('/api/download-and-upload', async (req, res) => {
     const tempMp3Path  = path.join(TEMP_DIR, `${trackId}.mp3`);
 
     // 1. Descargar y convertir
-    await downloadAndConvertToMP3(sourceUrl, tempMp3Path);
+    const actualDuration = await downloadAndConvertToMP3(sourceUrl, tempMp3Path, Number(duration) || 0);
 
     // 2. Subir a R2 bajo la carpeta del usuario
     const r2Url = await uploadToR2(tempMp3Path, mp3Key, 'audio/mpeg');
@@ -392,7 +422,7 @@ app.post('/api/download-and-upload', async (req, res) => {
         collectionName: collectionName || 'Álbum desconocido',
         artworkUrl: coverUrl || artworkUrl || null,
         downloadedAt: new Date().toISOString(),
-        duration: 0 // Se puede obtener con ffprobe si es necesario
+        duration: actualDuration
       }
     };
 
