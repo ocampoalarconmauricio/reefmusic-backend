@@ -3,7 +3,7 @@
  * 
  * Este servidor:
  * 1. Recibe una solicitud con datos de iTunes (título, artista, URL)
- * 2. Usa yt-dlp para descargar el audio de YouTube
+ * 2. Usa yt-dlp para descargar el audio de SoundCloud
  * 3. Convierte a MP3 con ffmpeg
  * 4. Sube a Cloudflare R2
  * 5. Retorna URL y metadatos para almacenar en la app
@@ -44,46 +44,6 @@ if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
-// YouTube bloquea las IPs de datacenter (como las de Render) pidiendo
-// "Sign in to confirm you're not a bot". La forma soportada de evitarlo
-// desde un servidor sin navegador es pasarle un cookies.txt de una sesión
-// real. Subilo como "Secret File" en Render (nombre "cookies.txt", se monta
-// en /etc/secrets/cookies.txt) o seteá YTDLP_COOKIES_PATH con la ruta.
-const YTDLP_COOKIES_SOURCE = process.env.YTDLP_COOKIES_PATH || '/etc/secrets/cookies.txt';
-// yt-dlp reescribe el archivo de cookies al terminar (para guardar cookies
-// renovadas), pero los Secret Files de Render se montan de solo lectura.
-// Copiamos el archivo a /tmp, que sí es escribible, y usamos esa copia.
-const YTDLP_COOKIES_PATH = path.join(TEMP_DIR, 'cookies.txt');
-if (fs.existsSync(YTDLP_COOKIES_SOURCE)) {
-  try {
-    fs.copyFileSync(YTDLP_COOKIES_SOURCE, YTDLP_COOKIES_PATH);
-    const lines = fs.readFileSync(YTDLP_COOKIES_PATH, 'utf-8').split('\n');
-    const looksNetscape = lines[0]?.startsWith('# Netscape HTTP Cookie File') || lines[0]?.startsWith('# HTTP Cookie File');
-    const youtubeCookieLines = lines.filter(l => /\.?youtube\.com|\.?google\.com/.test(l) && !l.startsWith('#')).length;
-    console.log(`🍪 cookies.txt copiado a una ruta escribible para yt-dlp (${lines.length} líneas, formato Netscape: ${looksNetscape}, cookies de youtube/google: ${youtubeCookieLines})`);
-    if (!looksNetscape || youtubeCookieLines === 0) {
-      console.warn('⚠️  El cookies.txt no parece válido — yt-dlp necesita el formato Netscape con cookies reales de una sesión logueada en youtube.com.');
-    }
-  } catch (err) {
-    console.error('No se pudo copiar cookies.txt a una ruta escribible:', err.message);
-  }
-} else {
-  console.warn(`⚠️  No se encontró cookies.txt en ${YTDLP_COOKIES_SOURCE} — las descargas van a fallar por el bloqueo anti-bot de YouTube.`);
-}
-
-function ytDlpCookieArgs() {
-  return fs.existsSync(YTDLP_COOKIES_PATH) ? ['--cookies', YTDLP_COOKIES_PATH] : [];
-}
-
-// El cliente "web" (el que usa yt-dlp por defecto) es el que YouTube más
-// exige con PO token en IPs de datacenter. "tv" suele esquivar ese chequeo
-// pero a veces no expone formatos para algunos videos puntuales — se listan
-// varios clientes para que yt-dlp se quede con el primero que tenga formatos
-// usables en vez de fallar entero por uno solo.
-function ytDlpClientArgs() {
-  return ['--extractor-args', 'youtube:player_client=tv,android,web'];
-}
-
 /**
  * Extrae el mensaje de error real de yt-dlp/ffmpeg (stderr) para poder
  * devolverlo en la respuesta y diagnosticar sin entrar a los logs de Render.
@@ -105,9 +65,9 @@ function generateTrackId() {
   return `track_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
-// IDs de video de YouTube: siempre 11 caracteres alfanuméricos (+ "-"/"_").
-// Se valida estricto porque el id se inserta como argumento de yt-dlp.
-const YOUTUBE_ID_RE = /^[A-Za-z0-9_-]{6,20}$/;
+// Las URLs de tracks de SoundCloud que aceptamos como "id" de una canción.
+// Se valida estricto porque la URL se inserta como argumento de yt-dlp.
+const SOUNDCLOUD_URL_RE = /^https:\/\/(www\.|m\.)?soundcloud\.com\/[\w\-\/]+(\?[\w=&-]+)?$/;
 
 /**
  * Limpia un texto para poder usarlo como nombre de archivo / clave de R2.
@@ -136,44 +96,30 @@ function encodeR2Key(key) {
 }
 
 /**
- * Busca en YouTube la canción usando yt-dlp (fallback cuando no hay
- * un videoId puntual elegido por el usuario).
+ * Busca en SoundCloud la canción usando yt-dlp (fallback cuando no hay
+ * una URL puntual elegida por el usuario).
  */
-function searchYouTube(query) {
-  try {
-    const result = execFileSync('yt-dlp', [
-      '-f', 'bestaudio/best', '--get-url',
-      `ytsearch:${query}`,
-      '-q', '--no-warnings',
-      ...ytDlpCookieArgs(),
-      ...ytDlpClientArgs()
-    ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
-
-    if (!result) {
-      throw new Error('No se encontró video en YouTube');
-    }
-
-    return result.split('\n')[0]; // Retorna la primera URL
-  } catch (error) {
-    const detail = processErrorMessage(error);
-    console.error('Error buscando en YouTube:', detail);
-    throw new Error(`No se pudo encontrar la canción en YouTube: ${detail}`);
+function searchSoundCloud(query) {
+  const results = searchSoundCloudMultiple(query, 1);
+  if (!results.length) {
+    throw new Error('No se encontró la canción en SoundCloud');
   }
+  return results[0].url;
 }
 
 /**
- * Busca en YouTube y devuelve varios resultados (título, canal, duración,
- * thumbnail, videoId) SIN descargar nada — para mostrar una lista al usuario.
+ * Busca en SoundCloud y devuelve varios resultados (título, artista,
+ * duración, thumbnail, url) SIN descargar nada — para mostrarle una lista
+ * al usuario. SoundCloud no tiene el bloqueo anti-bot que tiene YouTube en
+ * IPs de datacenter, así que no hace falta cookies ni trucos de cliente.
  */
-function searchYouTubeMultiple(query, limit = 12) {
+function searchSoundCloudMultiple(query, limit = 12) {
   try {
     const raw = execFileSync('yt-dlp', [
-      `ytsearch${limit}:${query}`,
+      `scsearch${limit}:${query}`,
       '--flat-playlist',
       '--dump-json',
-      '-q', '--no-warnings',
-      ...ytDlpCookieArgs(),
-      ...ytDlpClientArgs()
+      '-q', '--no-warnings'
     ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).trim();
 
     if (!raw) return [];
@@ -181,19 +127,21 @@ function searchYouTubeMultiple(query, limit = 12) {
     return raw.split('\n').filter(Boolean).map(line => {
       let v;
       try { v = JSON.parse(line); } catch (_) { return null; }
-      if (!v || !v.id) return null;
+      const trackUrl = v?.webpage_url || v?.url;
+      if (!v || !trackUrl) return null;
+      const thumb = v.thumbnail || (v.thumbnails?.length ? v.thumbnails[v.thumbnails.length - 1].url : '');
       return {
-        videoId: v.id,
+        url: trackUrl,
         title: v.title || 'Sin título',
-        artist: v.channel || v.uploader || '',
+        artist: v.uploader || v.channel || '',
         duration: v.duration || 0,
-        thumbnail: `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`,
+        thumbnail: thumb || '',
       };
     }).filter(Boolean);
   } catch (error) {
     const detail = processErrorMessage(error);
-    console.error('Error buscando en YouTube:', detail);
-    throw new Error(`No se pudo buscar en YouTube: ${detail}`);
+    console.error('Error buscando en SoundCloud:', detail);
+    throw new Error(`No se pudo buscar en SoundCloud: ${detail}`);
   }
 }
 
@@ -201,20 +149,15 @@ function searchYouTubeMultiple(query, limit = 12) {
  * Obtiene una URL de audio directa (para reproducir un preview) sin
  * descargar el archivo al disco.
  */
-function getStreamUrl(videoId) {
-  if (!YOUTUBE_ID_RE.test(videoId)) {
-    throw new Error('videoId inválido');
+function getStreamUrl(trackUrl) {
+  if (!SOUNDCLOUD_URL_RE.test(trackUrl)) {
+    throw new Error('URL de SoundCloud inválida');
   }
   try {
-    // Preferimos m4a/AAC en vez del webm/opus que suele ganar como
-    // "bestaudio": Safari/iOS no reproduce webm, así que sin esto el
-    // preview no suena en iPhone aunque la URL sea válida.
     const result = execFileSync('yt-dlp', [
-      '-f', 'bestaudio[ext=m4a]/bestaudio/best', '--get-url',
-      `https://www.youtube.com/watch?v=${videoId}`,
-      '-q', '--no-warnings',
-      ...ytDlpCookieArgs(),
-      ...ytDlpClientArgs()
+      '-f', 'bestaudio/best', '--get-url',
+      trackUrl,
+      '-q', '--no-warnings'
     ], { encoding: 'utf-8', maxBuffer: 1024 * 1024 }).trim();
 
     if (!result) throw new Error('No se pudo obtener el audio');
@@ -227,19 +170,17 @@ function getStreamUrl(videoId) {
 }
 
 /**
- * Descarga audio desde una URL de YouTube y lo convierte a MP3
+ * Descarga audio desde una URL de SoundCloud y lo convierte a MP3
  */
-async function downloadAndConvertToMP3(youtubeUrl, outputPath) {
+async function downloadAndConvertToMP3(trackUrl, outputPath) {
   try {
-    console.log(`📥 Descargando de: ${youtubeUrl}`);
+    console.log(`📥 Descargando de: ${trackUrl}`);
 
-    const tempAudio = path.join(TEMP_DIR, `temp_${Date.now()}.webm`);
+    const tempAudio = path.join(TEMP_DIR, `temp_${Date.now()}.audio`);
 
     // Descargar con yt-dlp
     execFileSync('yt-dlp', [
-      '-f', 'bestaudio/best', '-o', tempAudio, youtubeUrl, '-q', '--no-warnings',
-      ...ytDlpCookieArgs(),
-      ...ytDlpClientArgs()
+      '-f', 'bestaudio/best', '-o', tempAudio, trackUrl, '-q', '--no-warnings'
     ], { maxBuffer: 50 * 1024 * 1024 });
 
     if (!fs.existsSync(tempAudio)) {
@@ -370,7 +311,7 @@ function generateR2Authorization(method, key, date, contentLength) {
 /**
  * GET /api/search?q=...
  *
- * Busca canciones en YouTube (sin descargar) y devuelve una lista de
+ * Busca canciones en SoundCloud (sin descargar) y devuelve una lista de
  * resultados para que el usuario elija cuál quiere escuchar/descargar.
  */
 app.get('/api/search', (req, res) => {
@@ -380,7 +321,7 @@ app.get('/api/search', (req, res) => {
   }
 
   try {
-    const results = searchYouTubeMultiple(q, 12);
+    const results = searchSoundCloudMultiple(q, 12);
     return res.json({ success: true, results });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
@@ -388,19 +329,19 @@ app.get('/api/search', (req, res) => {
 });
 
 /**
- * GET /api/stream?id=videoId
+ * GET /api/stream?url=trackUrl
  *
  * Devuelve una URL de audio directa para reproducir un preview antes
  * de descargar la canción.
  */
 app.get('/api/stream', (req, res) => {
-  const id = (req.query.id || '').toString().trim();
-  if (!id) {
-    return res.status(400).json({ success: false, error: 'Falta el parámetro id' });
+  const trackUrl = (req.query.url || '').toString().trim();
+  if (!trackUrl) {
+    return res.status(400).json({ success: false, error: 'Falta el parámetro url' });
   }
 
   try {
-    const url = getStreamUrl(id);
+    const url = getStreamUrl(trackUrl);
     return res.json({ success: true, url });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
@@ -412,14 +353,14 @@ app.get('/api/stream', (req, res) => {
  *
  * Body (buscador nuevo, canción puntual ya elegida por el usuario):
  * {
- *   "videoId": "dQw4w9WgXcQ",
+ *   "trackUrl": "https://soundcloud.com/artista/cancion",
  *   "trackName": "Levitating",
  *   "artistName": "Dua Lipa",
  *   "artworkUrl": "https://...",
  *   "username": "maria"
  * }
  *
- * Body (modo legacy, sin videoId — busca a ciegas por texto):
+ * Body (modo legacy, sin trackUrl — busca a ciegas por texto):
  * {
  *   "trackName": "Levitating",
  *   "artistName": "Dua Lipa",
@@ -433,7 +374,7 @@ app.get('/api/stream', (req, res) => {
  * aparezca en su biblioteca al sincronizar.
  */
 app.post('/api/download-and-upload', async (req, res) => {
-  const { videoId, trackName, artistName, collectionName, artworkUrl, username } = req.body;
+  const { trackUrl, trackName, artistName, collectionName, artworkUrl, username } = req.body;
 
   try {
     const user = sanitizeUsername(username);
@@ -441,15 +382,15 @@ app.post('/api/download-and-upload', async (req, res) => {
       return res.status(400).json({ success: false, error: 'username es requerido' });
     }
 
-    let youtubeUrl;
+    let sourceUrl;
     let finalTrackName  = trackName;
     let finalArtistName = artistName;
 
-    if (videoId) {
-      if (!YOUTUBE_ID_RE.test(videoId)) {
-        return res.status(400).json({ success: false, error: 'videoId inválido' });
+    if (trackUrl) {
+      if (!SOUNDCLOUD_URL_RE.test(trackUrl)) {
+        return res.status(400).json({ success: false, error: 'trackUrl inválida' });
       }
-      youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      sourceUrl = trackUrl;
       finalTrackName  = trackName  || 'Sin título';
       finalArtistName = artistName || 'Artista desconocido';
     } else {
@@ -459,8 +400,8 @@ app.post('/api/download-and-upload', async (req, res) => {
           error: 'trackName y artistName son requeridos'
         });
       }
-      const query = `${trackName} ${artistName} official audio`;
-      youtubeUrl = searchYouTube(query);
+      const query = `${trackName} ${artistName}`;
+      sourceUrl = searchSoundCloud(query);
     }
 
     console.log(`\n🎵 Nuevo track: ${finalTrackName} - ${finalArtistName} (usuario: ${user})`);
@@ -473,7 +414,7 @@ app.post('/api/download-and-upload', async (req, res) => {
     const tempMp3Path  = path.join(TEMP_DIR, `${trackId}.mp3`);
 
     // 1. Descargar y convertir
-    await downloadAndConvertToMP3(youtubeUrl, tempMp3Path);
+    await downloadAndConvertToMP3(sourceUrl, tempMp3Path);
 
     // 2. Subir a R2 bajo la carpeta del usuario
     const r2Url = await uploadToR2(tempMp3Path, mp3Key, 'audio/mpeg');
