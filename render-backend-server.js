@@ -272,11 +272,13 @@ async function uploadToR2(filePath, fileName, contentType = 'audio/mpeg') {
  * Genera la cabecera de autorización AWS Signature V4 para R2
  */
 function generateR2Authorization(method, key, date, contentLength) {
-  const dateString = date.split(', ')[1].split(' ')[0];
-  const dateRegions = `${dateString.split(' ')[3]}${dateString.split(' ')[2]}${dateString.split(' ')[1].split(',')[0]}`;
-  
+  // "date" es un toUTCString(), ej: "Tue, 11 Aug 2026 00:34:03 GMT".
+  // Necesitamos el "dateStamp" YYYYMMDD para el scope de la firma.
+  const d = new Date(date);
+  const dateStamp = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+
   // AWS Signature V4 (simplificado para R2)
-  const scope = `${dateRegions}/auto/s3/aws4_request`;
+  const scope = `${dateStamp}/auto/s3/aws4_request`;
   
   const canonicalRequest = [
     method,
