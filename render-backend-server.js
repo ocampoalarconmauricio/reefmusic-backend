@@ -68,6 +68,42 @@ function generateTrackId() {
 // Se valida estricto porque la URL se inserta como argumento de yt-dlp.
 const SOUNDCLOUD_URL_RE = /^https:\/\/(www\.|m\.)?soundcloud\.com\/[\w\-\/]+(\?[\w=&-]+)?$/;
 
+// Links de YouTube pegados a mano — alternativa cuando SoundCloud no tiene
+// el audio completo disponible (DRM / solo preview). Mismo criterio: se
+// valida estricto porque la URL se inserta como argumento de yt-dlp.
+const YOUTUBE_URL_RE = /^https:\/\/(www\.|m\.|music\.)?(youtube\.com\/(watch\?v=|shorts\/)[\w-]{6,20}(&[\w=&.%-]*)?|youtu\.be\/[\w-]{6,20}(\?[\w=&.%-]*)?)$/;
+
+function isYoutubeUrl(url) {
+  return YOUTUBE_URL_RE.test(url);
+}
+
+// YouTube bloquea las IPs de datacenter (como las de Render) pidiendo
+// "Sign in to confirm you're not a bot". Se evita con un cookies.txt de una
+// sesión real (Secret File en Render, ver YTDLP_COOKIES_PATH) + forzando el
+// cliente "tv" (evita el chequeo en la mayoría de los casos; "android" y
+// "web" quedan de fallback para videos donde "tv" no expone formatos).
+const YTDLP_COOKIES_SOURCE = process.env.YTDLP_COOKIES_PATH || '/etc/secrets/cookies.txt';
+const YTDLP_COOKIES_PATH = path.join(TEMP_DIR, 'cookies.txt');
+if (fs.existsSync(YTDLP_COOKIES_SOURCE)) {
+  try {
+    // yt-dlp reescribe el archivo de cookies al terminar (para guardar cookies
+    // renovadas); los Secret Files de Render se montan de solo lectura, así
+    // que copiamos a /tmp, que sí es escribible.
+    fs.copyFileSync(YTDLP_COOKIES_SOURCE, YTDLP_COOKIES_PATH);
+    console.log('🍪 cookies.txt de YouTube listo (link pegado a mano)');
+  } catch (err) {
+    console.error('No se pudo copiar cookies.txt a una ruta escribible:', err.message);
+  }
+} else {
+  console.warn(`⚠️  No se encontró cookies.txt en ${YTDLP_COOKIES_SOURCE} — pegar links de YouTube probablemente falle por el bloqueo anti-bot.`);
+}
+
+function ytDlpYoutubeArgs() {
+  const args = ['--extractor-args', 'youtube:player_client=tv,android,web'];
+  if (fs.existsSync(YTDLP_COOKIES_PATH)) args.push('--cookies', YTDLP_COOKIES_PATH);
+  return args;
+}
+
 /**
  * Limpia un texto para poder usarlo como nombre de archivo / clave de R2.
  */
@@ -141,14 +177,16 @@ function searchSoundCloudMultiple(query, limit = 5) {
  * descargar el archivo al disco.
  */
 function getStreamUrl(trackUrl) {
-  if (!SOUNDCLOUD_URL_RE.test(trackUrl)) {
-    throw new Error('URL de SoundCloud inválida');
+  const isYt = isYoutubeUrl(trackUrl);
+  if (!isYt && !SOUNDCLOUD_URL_RE.test(trackUrl)) {
+    throw new Error('URL inválida');
   }
   try {
     const result = execFileSync('yt-dlp', [
       '-f', 'bestaudio/best', '--get-url',
       trackUrl,
-      '-q', '--no-warnings'
+      '-q', '--no-warnings',
+      ...(isYt ? ytDlpYoutubeArgs() : [])
     ], { encoding: 'utf-8', maxBuffer: 1024 * 1024 }).trim();
 
     if (!result) throw new Error('No se pudo obtener el audio');
@@ -157,6 +195,37 @@ function getStreamUrl(trackUrl) {
     const detail = processErrorMessage(error);
     console.error('Error obteniendo stream:', detail);
     throw new Error(`No se pudo obtener el audio de esa canción: ${detail}`);
+  }
+}
+
+/**
+ * Lee metadata (título, canal, duración, thumbnail) de un link de YouTube
+ * SIN descargarlo — para prellenar el modal de confirmación.
+ */
+function getYoutubeInfo(url) {
+  if (!isYoutubeUrl(url)) {
+    throw new Error('Ese link no parece ser de YouTube');
+  }
+  try {
+    const raw = execFileSync('yt-dlp', [
+      '--dump-json', '--no-warnings', '-q', '--skip-download',
+      url,
+      ...ytDlpYoutubeArgs()
+    ], { encoding: 'utf-8', maxBuffer: 5 * 1024 * 1024 }).trim();
+
+    const v = JSON.parse(raw.split('\n')[0]);
+    const thumb = v.thumbnail || (v.thumbnails?.length ? v.thumbnails[v.thumbnails.length - 1].url : '');
+    return {
+      url: v.webpage_url || url,
+      title: v.title || 'Sin título',
+      artist: v.channel || v.uploader || '',
+      duration: v.duration || 0,
+      thumbnail: thumb || '',
+    };
+  } catch (error) {
+    const detail = processErrorMessage(error);
+    console.error('Error leyendo link de YouTube:', detail);
+    throw new Error(`No se pudo leer ese link de YouTube: ${detail}`);
   }
 }
 
@@ -186,25 +255,30 @@ function getAudioDuration(filePath) {
  * metadata reporte la duración completa. Si detectamos ese caso, fallamos
  * con un mensaje claro en vez de subir un clip de 30s sin avisar.
  */
-async function downloadAndConvertToMP3(trackUrl, outputPath, expectedDuration = 0) {
+async function downloadAndConvertToMP3(trackUrl, outputPath, expectedDuration = 0, trimStart = 0) {
   try {
     console.log(`📥 Descargando de: ${trackUrl}`);
 
     const tempAudio = path.join(TEMP_DIR, `temp_${Date.now()}.audio`);
+    const isYt = isYoutubeUrl(trackUrl);
 
     // Descargar con yt-dlp
     execFileSync('yt-dlp', [
-      '-f', 'bestaudio/best', '-o', tempAudio, trackUrl, '-q', '--no-warnings'
+      '-f', 'bestaudio/best', '-o', tempAudio, trackUrl, '-q', '--no-warnings',
+      ...(isYt ? ytDlpYoutubeArgs() : [])
     ], { maxBuffer: 50 * 1024 * 1024 });
 
     if (!fs.existsSync(tempAudio)) {
       throw new Error('La descarga falló');
     }
 
-    console.log(`🔄 Convirtiendo a MP3...`);
+    console.log(`🔄 Convirtiendo a MP3...${trimStart > 0 ? ` (recortando los primeros ${trimStart}s)` : ''}`);
 
-    // Convertir a MP3 con ffmpeg
+    // Convertir a MP3 con ffmpeg. "-ss" antes de "-i" recorta desde el
+    // inicio (silencio al principio, restos de intro, etc.) sin re-escanear
+    // todo el archivo.
     execFileSync('ffmpeg', [
+      ...(trimStart > 0 ? ['-ss', String(trimStart)] : []),
       '-i', tempAudio, '-q:a', '0', '-map', 'a', outputPath, '-y', '-loglevel', 'error'
     ]);
 
@@ -218,9 +292,9 @@ async function downloadAndConvertToMP3(trackUrl, outputPath, expectedDuration = 
     const actualDuration = getAudioDuration(outputPath);
     console.log(`✅ MP3 listo: ${outputPath} (${actualDuration}s, esperados ~${expectedDuration}s)`);
 
-    if (actualDuration > 0 && actualDuration <= 35 && expectedDuration > 60) {
+    if (!isYt && actualDuration > 0 && actualDuration <= 35 && expectedDuration > 60) {
       fs.unlinkSync(outputPath);
-      throw new Error('Esta canción solo tiene disponible un preview de 30s en SoundCloud (restricción de derechos del sello discográfico) — no se puede descargar completa. Probá buscar un remix, versión en vivo, DJ set o subida de otro usuario.');
+      throw new Error('Esta canción solo tiene disponible un preview de 30s en SoundCloud (restricción de derechos del sello discográfico) — no se puede descargar completa. Probá buscar un remix, versión en vivo, DJ set, subida de otro usuario, o pegá el link de YouTube.');
     }
 
     return actualDuration;
@@ -232,16 +306,31 @@ async function downloadAndConvertToMP3(trackUrl, outputPath, expectedDuration = 
 }
 
 /**
- * Descarga una imagen de portada (thumbnail) y la sube a R2 junto a la
- * canción. Best-effort: si falla, no rompe el flujo de descarga principal.
+ * Sube una portada a R2 junto a la canción. Acepta tanto una URL http(s)
+ * (thumbnail de SoundCloud/YouTube o sugerencia de iTunes) como una
+ * data:URL en base64 (imagen elegida a mano por el usuario). Best-effort:
+ * si falla, no rompe el flujo de descarga principal.
  */
-async function uploadCoverIfPossible(thumbnailUrl, coverKey) {
-  if (!thumbnailUrl) return null;
+async function uploadCoverIfPossible(imageSource, coverKey) {
+  if (!imageSource) return null;
   const tempCover = path.join(TEMP_DIR, `cover_${Date.now()}.jpg`);
   try {
-    const resp = await axios.get(thumbnailUrl, { responseType: 'arraybuffer', timeout: 8000 });
-    fs.writeFileSync(tempCover, resp.data);
-    const url = await uploadToR2(tempCover, coverKey, 'image/jpeg');
+    let buffer;
+    let contentType = 'image/jpeg';
+
+    if (imageSource.startsWith('data:')) {
+      const match = imageSource.match(/^data:([^;]+);base64,(.+)$/s);
+      if (!match) throw new Error('Formato de imagen inválido');
+      contentType = match[1] || 'image/jpeg';
+      buffer = Buffer.from(match[2], 'base64');
+    } else {
+      const resp = await axios.get(imageSource, { responseType: 'arraybuffer', timeout: 8000 });
+      buffer = resp.data;
+      contentType = resp.headers['content-type'] || 'image/jpeg';
+    }
+
+    fs.writeFileSync(tempCover, buffer);
+    const url = await uploadToR2(tempCover, coverKey, contentType);
     return url;
   } catch (error) {
     console.warn('No se pudo subir la portada:', error.message);
@@ -335,6 +424,27 @@ app.get('/api/stream', (req, res) => {
 });
 
 /**
+ * GET /api/youtube-info?url=...
+ *
+ * Lee metadata de un link de YouTube pegado a mano (sin descargar) para
+ * prellenar el modal de confirmación — alternativa cuando SoundCloud no
+ * tiene el audio completo disponible (DRM / solo preview de 30s).
+ */
+app.get('/api/youtube-info', (req, res) => {
+  const url = (req.query.url || '').toString().trim();
+  if (!url) {
+    return res.status(400).json({ success: false, error: 'Falta el parámetro url' });
+  }
+
+  try {
+    const info = getYoutubeInfo(url);
+    return res.json({ success: true, ...info });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * POST /api/download-and-upload
  *
  * Body (buscador nuevo, canción puntual ya elegida por el usuario):
@@ -360,7 +470,7 @@ app.get('/api/stream', (req, res) => {
  * aparezca en su biblioteca al sincronizar.
  */
 app.post('/api/download-and-upload', async (req, res) => {
-  const { trackUrl, trackName, artistName, collectionName, artworkUrl, username, duration } = req.body;
+  const { trackUrl, trackName, artistName, collectionName, artworkUrl, username, duration, trimStart } = req.body;
 
   try {
     const user = sanitizeUsername(username);
@@ -373,7 +483,7 @@ app.post('/api/download-and-upload', async (req, res) => {
     let finalArtistName = artistName;
 
     if (trackUrl) {
-      if (!SOUNDCLOUD_URL_RE.test(trackUrl)) {
+      if (!SOUNDCLOUD_URL_RE.test(trackUrl) && !isYoutubeUrl(trackUrl)) {
         return res.status(400).json({ success: false, error: 'trackUrl inválida' });
       }
       sourceUrl = trackUrl;
@@ -400,7 +510,7 @@ app.post('/api/download-and-upload', async (req, res) => {
     const tempMp3Path  = path.join(TEMP_DIR, `${trackId}.mp3`);
 
     // 1. Descargar y convertir
-    const actualDuration = await downloadAndConvertToMP3(sourceUrl, tempMp3Path, Number(duration) || 0);
+    const actualDuration = await downloadAndConvertToMP3(sourceUrl, tempMp3Path, Number(duration) || 0, Math.max(0, Number(trimStart) || 0));
 
     // 2. Subir a R2 bajo la carpeta del usuario
     const r2Url = await uploadToR2(tempMp3Path, mp3Key, 'audio/mpeg');
