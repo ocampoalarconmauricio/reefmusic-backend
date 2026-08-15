@@ -16,6 +16,7 @@ const cors = require('cors');
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const axios = require('axios');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
@@ -28,7 +29,10 @@ app.use(express.json({ limit: '10mb' }));
 // CONFIGURACIÓN
 // ────────────────────────────────────────────────────────────────────────────
 
-const TEMP_DIR = '/tmp/reefmusic';
+// os.tmpdir() respeta $TMPDIR — en Render es /tmp, en Termux es
+// $PREFIX/tmp (no existe un /tmp real de sistema ahí, por eso no se puede
+// hardcodear "/tmp").
+const TEMP_DIR = path.join(os.tmpdir(), 'reefmusic');
 const RENDER_BACKEND_URL = process.env.RENDER_BACKEND_URL || 'http://localhost:3000';
 
 // Cloudflare R2
@@ -67,42 +71,6 @@ function generateTrackId() {
 // Las URLs de tracks de SoundCloud que aceptamos como "id" de una canción.
 // Se valida estricto porque la URL se inserta como argumento de yt-dlp.
 const SOUNDCLOUD_URL_RE = /^https:\/\/(www\.|m\.)?soundcloud\.com\/[\w\-\/]+(\?[\w=&-]+)?$/;
-
-// Links de YouTube pegados a mano — alternativa cuando SoundCloud no tiene
-// el audio completo disponible (DRM / solo preview). Mismo criterio: se
-// valida estricto porque la URL se inserta como argumento de yt-dlp.
-const YOUTUBE_URL_RE = /^https:\/\/(www\.|m\.|music\.)?(youtube\.com\/(watch\?v=|shorts\/)[\w-]{6,20}(&[\w=&.%-]*)?|youtu\.be\/[\w-]{6,20}(\?[\w=&.%-]*)?)$/;
-
-function isYoutubeUrl(url) {
-  return YOUTUBE_URL_RE.test(url);
-}
-
-// YouTube bloquea las IPs de datacenter (como las de Render) pidiendo
-// "Sign in to confirm you're not a bot". Se evita con un cookies.txt de una
-// sesión real (Secret File en Render, ver YTDLP_COOKIES_PATH) + forzando el
-// cliente "tv" (evita el chequeo en la mayoría de los casos; "android" y
-// "web" quedan de fallback para videos donde "tv" no expone formatos).
-const YTDLP_COOKIES_SOURCE = process.env.YTDLP_COOKIES_PATH || '/etc/secrets/cookies.txt';
-const YTDLP_COOKIES_PATH = path.join(TEMP_DIR, 'cookies.txt');
-if (fs.existsSync(YTDLP_COOKIES_SOURCE)) {
-  try {
-    // yt-dlp reescribe el archivo de cookies al terminar (para guardar cookies
-    // renovadas); los Secret Files de Render se montan de solo lectura, así
-    // que copiamos a /tmp, que sí es escribible.
-    fs.copyFileSync(YTDLP_COOKIES_SOURCE, YTDLP_COOKIES_PATH);
-    console.log('🍪 cookies.txt de YouTube listo (link pegado a mano)');
-  } catch (err) {
-    console.error('No se pudo copiar cookies.txt a una ruta escribible:', err.message);
-  }
-} else {
-  console.warn(`⚠️  No se encontró cookies.txt en ${YTDLP_COOKIES_SOURCE} — pegar links de YouTube probablemente falle por el bloqueo anti-bot.`);
-}
-
-function ytDlpYoutubeArgs() {
-  const args = ['--extractor-args', 'youtube:player_client=tv,android,web'];
-  if (fs.existsSync(YTDLP_COOKIES_PATH)) args.push('--cookies', YTDLP_COOKIES_PATH);
-  return args;
-}
 
 /**
  * Limpia un texto para poder usarlo como nombre de archivo / clave de R2.
@@ -174,19 +142,20 @@ function searchSoundCloudMultiple(query, limit = 5) {
 
 /**
  * Obtiene una URL de audio directa (para reproducir un preview) sin
- * descargar el archivo al disco.
+ * descargar el archivo al disco. Preferimos un formato progresivo (no
+ * HLS/m3u8): un <audio src="..."> normal solo puede reproducir HLS en
+ * Safari/iOS — en Chrome y Firefox el preview queda mudo en silencio si
+ * yt-dlp elige un stream HLS como "mejor" formato.
  */
 function getStreamUrl(trackUrl) {
-  const isYt = isYoutubeUrl(trackUrl);
-  if (!isYt && !SOUNDCLOUD_URL_RE.test(trackUrl)) {
-    throw new Error('URL inválida');
+  if (!SOUNDCLOUD_URL_RE.test(trackUrl)) {
+    throw new Error('URL de SoundCloud inválida');
   }
   try {
     const result = execFileSync('yt-dlp', [
-      '-f', 'bestaudio/best', '--get-url',
+      '-f', 'bestaudio[protocol!*=m3u8]/bestaudio/best', '--get-url',
       trackUrl,
-      '-q', '--no-warnings',
-      ...(isYt ? ytDlpYoutubeArgs() : [])
+      '-q', '--no-warnings'
     ], { encoding: 'utf-8', maxBuffer: 1024 * 1024 }).trim();
 
     if (!result) throw new Error('No se pudo obtener el audio');
@@ -195,37 +164,6 @@ function getStreamUrl(trackUrl) {
     const detail = processErrorMessage(error);
     console.error('Error obteniendo stream:', detail);
     throw new Error(`No se pudo obtener el audio de esa canción: ${detail}`);
-  }
-}
-
-/**
- * Lee metadata (título, canal, duración, thumbnail) de un link de YouTube
- * SIN descargarlo — para prellenar el modal de confirmación.
- */
-function getYoutubeInfo(url) {
-  if (!isYoutubeUrl(url)) {
-    throw new Error('Ese link no parece ser de YouTube');
-  }
-  try {
-    const raw = execFileSync('yt-dlp', [
-      '--dump-json', '--no-warnings', '-q', '--skip-download',
-      url,
-      ...ytDlpYoutubeArgs()
-    ], { encoding: 'utf-8', maxBuffer: 5 * 1024 * 1024 }).trim();
-
-    const v = JSON.parse(raw.split('\n')[0]);
-    const thumb = v.thumbnail || (v.thumbnails?.length ? v.thumbnails[v.thumbnails.length - 1].url : '');
-    return {
-      url: v.webpage_url || url,
-      title: v.title || 'Sin título',
-      artist: v.channel || v.uploader || '',
-      duration: v.duration || 0,
-      thumbnail: thumb || '',
-    };
-  } catch (error) {
-    const detail = processErrorMessage(error);
-    console.error('Error leyendo link de YouTube:', detail);
-    throw new Error(`No se pudo leer ese link de YouTube: ${detail}`);
   }
 }
 
@@ -260,12 +198,10 @@ async function downloadAndConvertToMP3(trackUrl, outputPath, expectedDuration = 
     console.log(`📥 Descargando de: ${trackUrl}`);
 
     const tempAudio = path.join(TEMP_DIR, `temp_${Date.now()}.audio`);
-    const isYt = isYoutubeUrl(trackUrl);
 
     // Descargar con yt-dlp
     execFileSync('yt-dlp', [
-      '-f', 'bestaudio/best', '-o', tempAudio, trackUrl, '-q', '--no-warnings',
-      ...(isYt ? ytDlpYoutubeArgs() : [])
+      '-f', 'bestaudio/best', '-o', tempAudio, trackUrl, '-q', '--no-warnings'
     ], { maxBuffer: 50 * 1024 * 1024 });
 
     if (!fs.existsSync(tempAudio)) {
@@ -292,9 +228,9 @@ async function downloadAndConvertToMP3(trackUrl, outputPath, expectedDuration = 
     const actualDuration = getAudioDuration(outputPath);
     console.log(`✅ MP3 listo: ${outputPath} (${actualDuration}s, esperados ~${expectedDuration}s)`);
 
-    if (!isYt && actualDuration > 0 && actualDuration <= 35 && expectedDuration > 60) {
+    if (actualDuration > 0 && actualDuration <= 35 && expectedDuration > 60) {
       fs.unlinkSync(outputPath);
-      throw new Error('Esta canción solo tiene disponible un preview de 30s en SoundCloud (restricción de derechos del sello discográfico) — no se puede descargar completa. Probá buscar un remix, versión en vivo, DJ set, subida de otro usuario, o pegá el link de YouTube.');
+      throw new Error('Esta canción solo tiene disponible un preview de 30s en SoundCloud (restricción de derechos del sello discográfico) — no se puede descargar completa. Probá buscar un remix, versión en vivo, DJ set, o subida de otro usuario.');
     }
 
     return actualDuration;
@@ -307,7 +243,7 @@ async function downloadAndConvertToMP3(trackUrl, outputPath, expectedDuration = 
 
 /**
  * Sube una portada a R2 junto a la canción. Acepta tanto una URL http(s)
- * (thumbnail de SoundCloud/YouTube o sugerencia de iTunes) como una
+ * (thumbnail de SoundCloud o sugerencia de iTunes) como una
  * data:URL en base64 (imagen elegida a mano por el usuario). Best-effort:
  * si falla, no rompe el flujo de descarga principal.
  */
@@ -396,7 +332,7 @@ app.get('/api/search', (req, res) => {
   }
 
   try {
-    const results = searchSoundCloudMultiple(q, 5);
+    const results = searchSoundCloudMultiple(q, 3);
     return res.json({ success: true, results });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
@@ -418,27 +354,6 @@ app.get('/api/stream', (req, res) => {
   try {
     const url = getStreamUrl(trackUrl);
     return res.json({ success: true, url });
-  } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * GET /api/youtube-info?url=...
- *
- * Lee metadata de un link de YouTube pegado a mano (sin descargar) para
- * prellenar el modal de confirmación — alternativa cuando SoundCloud no
- * tiene el audio completo disponible (DRM / solo preview de 30s).
- */
-app.get('/api/youtube-info', (req, res) => {
-  const url = (req.query.url || '').toString().trim();
-  if (!url) {
-    return res.status(400).json({ success: false, error: 'Falta el parámetro url' });
-  }
-
-  try {
-    const info = getYoutubeInfo(url);
-    return res.json({ success: true, ...info });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
   }
@@ -483,7 +398,7 @@ app.post('/api/download-and-upload', async (req, res) => {
     let finalArtistName = artistName;
 
     if (trackUrl) {
-      if (!SOUNDCLOUD_URL_RE.test(trackUrl) && !isYoutubeUrl(trackUrl)) {
+      if (!SOUNDCLOUD_URL_RE.test(trackUrl)) {
         return res.status(400).json({ success: false, error: 'trackUrl inválida' });
       }
       sourceUrl = trackUrl;
